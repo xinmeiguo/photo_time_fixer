@@ -11,7 +11,8 @@
 - **绝对起始时间**：填一个起始时刻，之后按「每张间隔 N 分钟」依次递增，可选附加 0~59 随机秒。
 - **整体偏移**：对每张文件已有的拍摄时间/修改时间整体加减，用于批量校正时差。
 - **时间格式不限**：`2026-10-19 16:30`、`2026/10/19 16点30分`、`20261019 163000`、`下午4:30`、全角字符、RFC3339 等都能识别，界面上实时显示"识别结果"。
-- **预览 + 备份 + 恢复**：应用前生成 `undo_<时间戳>.json`，可从界面「恢复…」一键回滚。
+- **预览 + 备份 + 恢复**：应用前生成 `undo_<时间戳>.json`，可从界面「恢复…」一键回滚。恢复完成会自动重新扫描，预览表里的原时间立即刷新。
+- **批量处理可随时取消**：进度条旁的「取消」按钮生效于当前文件处理完之后，已改过的文件不回滚（要回滚请用备份）。
 
 ### 2. 视频格式转换
 
@@ -21,10 +22,11 @@
   - **重编码**：H.264 + AAC，跨格式转换用这个。
   - **仅封装**：`-c copy`，最快且不损画质，但要求编码与目标容器兼容（如 mp4 ↔ mkv）。
 - **指定视频码率**（kbps）压小文件；不指定则用 CRF 20 自动质量。
-- **元数据不丢**：ffmpeg `-map_metadata` + exiftool `-TagsFromFile` 双重复制。
+- **元数据不丢**：ffmpeg `-map_metadata` + exiftool `-TagsFromFile` 双重复制；整批文件只启动**一次** exiftool（不是每个文件一次）。
 - **文件时间不变成"现在"**：转换完成后把源文件的创建/修改/访问时间原样写回输出文件。
 - 默认输出到 `<所选文件夹>\out`，处理前会验证目录可写（网络共享无权限会提前提示）。
 - 递归扫描时输出目录内的文件会被排除，避免重复转换。
+- **可中途取消**：取消后正在跑的 ffmpeg 会被立即终止，未完成的输出文件自动删除，后面的文件不再开工。
 
 ## 依赖的第三方工具
 
@@ -37,6 +39,8 @@
 
 也可以自己装好放进 PATH，程序会优先用 exe 同级 `tools/`，其次 PATH，最后常见安装位置。
 
+下载时会显示「已下载 / 总大小」进度条（分块流式读取，不是干等），失败自动重试 3 次（gyan.dev 偶发 502 基本一次重试就过）。收不够 Content-Length 会判为截断，直接报错而不是交给解压器报"文件末端损坏"。
+
 ## 构建
 
 要求 Rust 1.88+ 与 **GNU 工具链**（`x86_64-pc-windows-gnu`，由 `rust-toolchain.toml` 锁定），另需 mingw 的 `windres`（编 Windows 资源节）。
@@ -46,7 +50,10 @@
 cargo build --release
 ```
 
-产物：`target/release/photo_time_fixer.exe`（约 28 MB，静态链接 mingw 运行时，只依赖系统 DLL）。
+产物：`target/release/photo_time_fixer.exe`（约 8 MB，静态链接 mingw 运行时，只依赖系统 DLL）。
+
+发布配置按体积优先（`Cargo.toml` 的 `[profile.release]`）：`opt-level = "s"` + 全量 LTO + `codegen-units = 1` + `strip = true`。
+代价是链接时间明显变长（约 10 分钟），但产物从 28 MB 降到 8 MB。
 
 > 项目路径含中文时，建议把 target 放到纯 ASCII 目录：
 > `CARGO_TARGET_DIR=D:/ptf-target cargo build --release`
@@ -65,11 +72,18 @@ cargo build --release
 ```
 src/
 ├── main.rs        入口：窗口尺寸、窗口图标、设计系统初始化
-├── app.rs         egui 界面与全部状态机（Tab、后台线程轮询）
+├── app/           egui 界面（按职责拆分）
+│   ├── mod.rs         状态定义、面板骨架、备份失败弹窗
+│   ├── state.rs       界面状态类型、后台消息枚举、路径小工具
+│   ├── poll.rs        后台线程消息回收（唯一一处 try_recv）
+│   ├── actions.rs     用户动作：扫描 / 应用 / 转换 / 下载
+│   ├── tab_time.rs    「修改时间」页渲染
+│   └── tab_convert.rs 「视频格式转换」页渲染
 ├── apply.rs       时间计划计算、文件系统时间写入
 ├── datetime.rs    任意格式的时间解析
-├── exiftool.rs    exiftool 检测 / 下载 / 元数据读写
-├── ffmpeg.rs      ffmpeg 检测 / 下载 / 视频转换
+├── download.rs    HTTP 流式下载（进度回调 + 失败重试 + 截断校验）
+├── exiftool.rs    exiftool 检测 / 下载 / 元数据读写（支持整批一次复制）
+├── ffmpeg.rs      ffmpeg 检测 / 下载 / 转码与批量收尾
 ├── files.rs       目录扫描与照片/视频分类
 ├── backup.rs      修改前备份与恢复
 └── ds.rs          egui_sauge 设计系统接入（字体表、主题、字号层级）

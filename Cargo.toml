@@ -30,3 +30,11 @@ windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem", "Win32
 
 [target.'cfg(not(windows))'.dependencies]
 filetime = "0.2"
+
+# 发布产物是个直接分发的单文件 exe：调试符号没有、运行速度也没那么敏感，
+# 所以按「体积优先」配置。代价是链接时间明显变长（LTO + 1 个 codegen unit）。
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

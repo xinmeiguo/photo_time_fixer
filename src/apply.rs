@@ -93,6 +93,12 @@ pub enum ProgressMsg {
         total: usize,
         current: String,
     },
+    /// 用户取消：已完成 done 个，附带已完成部分的结果。
+    Cancelled {
+        done: usize,
+        total: usize,
+        report: Vec<(String, Result<(), String>)>,
+    },
     /// 处理完成，附带每个文件的结果。
     Done(Vec<(String, Result<(), String>)>),
 }
@@ -153,17 +159,31 @@ pub fn apply_one(
 
 /// 应用计划（带进度回传）。在后台线程中逐文件处理，并通过 `tx` 实时上报进度，
 /// 全部完成后发送 `ProgressMsg::Done`。
+///
+/// `cancel` 每处理完一个文件检查一次；置位则停止开工并发送 `ProgressMsg::Cancelled`。
+/// 已改过的文件**不回滚**（回滚请用备份「恢复…」），只是不再继续。
 pub fn apply_with_progress(
     plan: Vec<PlanItem>,
     offset: FixedOffset,
     set_created: bool,
     set_modified: bool,
     set_taken: bool,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     tx: std::sync::mpsc::Sender<ProgressMsg>,
 ) {
+    use std::sync::atomic::Ordering;
+
     let total = plan.len();
     let mut report = Vec::with_capacity(total);
     for (i, item) in plan.into_iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = tx.send(ProgressMsg::Cancelled {
+                done: i,
+                total,
+                report,
+            });
+            return;
+        }
         let name = item.file.name.clone();
         let current = item.file.name.clone();
         let res = apply_one(&item, offset, set_created, set_modified, set_taken);
@@ -229,4 +249,107 @@ pub fn set_fs_times(
 ) -> std::io::Result<()> {
     // Unix 没有“创建时间”概念，仅设置访问/修改时间。
     filetime::set_file_times(path, accessed.into(), modified.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+    use std::path::PathBuf;
+
+    fn media(name: &str, taken: Option<&str>, modified: Option<&str>) -> MediaFile {
+        MediaFile {
+            path: PathBuf::from(name),
+            name: name.to_string(),
+            kind: MediaKind::Photo,
+            original_taken: taken.map(|s| s.to_string()),
+            original_modified: modified.and_then(parse_taken),
+        }
+    }
+
+    fn base() -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(2026, 1, 1)
+            .unwrap()
+            .and_hms_opt(9, 0, 0)
+            .unwrap()
+    }
+
+    fn text(dt: NaiveDateTime) -> String {
+        dt.format("%Y-%m-%d %H:%M:%S").to_string()
+    }
+
+    /// exiftool 回传的格式是冒号分隔（2020:01:01），但我们自己的备份/预览
+    /// 是连字符格式，两种都必须认。
+    #[test]
+    fn parse_taken_accepts_both_separators() {
+        assert!(parse_taken("2020:01:01 10:00:00").is_some());
+        assert!(parse_taken("2020-01-01 10:00:00").is_some());
+        assert!(parse_taken("2020-01-01 10:00").is_some());
+        // 前后空白要容忍（JSON 回传偶尔带空格）
+        assert!(parse_taken("  2020:01:01 10:00:00  ").is_some());
+        assert!(parse_taken("not a date").is_none());
+        assert!(parse_taken("").is_none());
+    }
+
+    /// 绝对模式：从起始时间开始，按固定间隔依次排下去。
+    #[test]
+    fn absolute_plan_is_sequential() {
+        let files = vec![
+            media("a.jpg", None, None),
+            media("b.jpg", None, None),
+            media("c.jpg", None, None),
+        ];
+        let plan = compute_plan(
+            &files,
+            &PlanInput {
+                mode: PlanMode::Absolute(base()),
+                interval_min: 2,
+                random: false,
+                offset: Duration::zero(),
+            },
+        );
+        assert_eq!(plan.len(), 3);
+        assert_eq!(text(plan[0].new_time), "2026-01-01 09:00:00");
+        assert_eq!(text(plan[1].new_time), "2026-01-01 09:02:00");
+        assert_eq!(text(plan[2].new_time), "2026-01-01 09:04:00");
+    }
+
+    /// 偏移模式：优先用拍摄时间，没有就退回文件修改时间；
+    /// 两者都没有的文件跳过（无处可偏移，硬套偏移会凭空造时间）。
+    #[test]
+    fn offset_plan_uses_taken_then_modified() {
+        let files = vec![
+            media("a.jpg", Some("2020:01:01 10:00:00"), None),
+            media("b.jpg", None, Some("2021-02-02 11:00:00")),
+            media("c.jpg", None, None),
+        ];
+        let plan = compute_plan(
+            &files,
+            &PlanInput {
+                mode: PlanMode::Offset,
+                interval_min: 0,
+                random: false,
+                offset: Duration::hours(8),
+            },
+        );
+        assert_eq!(plan.len(), 2, "没有任何时间的文件必须跳过");
+        assert_eq!(text(plan[0].new_time), "2020-01-01 18:00:00");
+        assert_eq!(text(plan[1].new_time), "2021-02-02 19:00:00");
+    }
+
+    /// 负偏移（提前）也要算对，且跨日不能溢出。
+    #[test]
+    fn offset_can_go_backwards_across_midnight() {
+        let files = vec![media("a.jpg", Some("2020:01:01 02:00:00"), None)];
+        let plan = compute_plan(
+            &files,
+            &PlanInput {
+                mode: PlanMode::Offset,
+                interval_min: 0,
+                random: false,
+                offset: Duration::hours(-5),
+            },
+        );
+        assert_eq!(text(plan[0].new_time), "2019-12-31 21:00:00");
+    }
 }

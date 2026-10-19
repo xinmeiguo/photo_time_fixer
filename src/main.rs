@@ -2,6 +2,7 @@ mod app;
 mod apply;
 mod backup;
 mod datetime;
+mod download;
 mod ds;
 mod exiftool;
 mod ffmpeg;

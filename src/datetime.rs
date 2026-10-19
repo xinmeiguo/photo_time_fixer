@@ -176,7 +176,7 @@ pub fn parse_flexible(input: &str) -> Option<NaiveDateTime> {
         }
     }
     // 仅日期
-    for fmt in ["%Y-%m-%d", "%Y/%m/%d", "%Y.%m/%d", "%Y%m%d", "%Y年%m月%d日"] {
+    for fmt in ["%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y%m%d", "%Y年%m月%d日"] {
         if let Ok(d) = NaiveDate::parse_from_str(&s, fmt) {
             return d.and_hms_opt(0, 0, 0);
         }
@@ -233,5 +233,12 @@ mod tests {
     fn test_invalid() {
         assert_eq!(parse_flexible("乱码xyz"), None);
         assert_eq!(parse_flexible(""), None);
+    }
+
+    /// 点号分隔的「仅日期」曾因格式串写成 `%Y.%m/%d` 而匹配不上。
+    #[test]
+    fn test_dotted_date_only() {
+        assert_eq!(fmt("2023.05.01"), Some("2023-05-01 00:00:00".into()));
+        assert_eq!(fmt("2023.5.1"), Some("2023-05-01 00:00:00".into()));
     }
 }

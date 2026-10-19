@@ -142,3 +142,72 @@ pub fn restore(path: &str) -> Vec<(String, Result<(), String>)> {
     }
     report
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn unique(tag: &str, ext: &str) -> PathBuf {
+        let ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        std::env::temp_dir().join(format!("ptf_{tag}_{}_{}.{ext}", std::process::id(), ms))
+    }
+
+    /// 备份的用途就是「改坏了能回到原样」：写进去的时间必须能原值恢复。
+    #[test]
+    fn restore_puts_file_times_back() {
+        let p = unique("restore", "bin");
+        std::fs::write(&p, b"x").unwrap();
+        let t0 = UNIX_EPOCH + StdDuration::from_secs(1_600_000_000);
+        crate::apply::set_fs_times(&p, t0, t0, t0).unwrap();
+
+        let backup = Backup {
+            created_at: "2026-01-01 00:00:00".into(),
+            offset_secs: 8 * 3600,
+            entries: vec![Entry {
+                path: p.to_string_lossy().to_string(),
+                file_created: 1_600_000_000,
+                file_modified: 1_600_000_000,
+                // 不设 taken：本例只验证文件系统时间，不依赖 exiftool
+                taken: None,
+            }],
+        };
+        let bpath = unique("backup", "json");
+        std::fs::write(&bpath, serde_json::to_string(&backup).unwrap()).unwrap();
+
+        // 先把时间改掉，确认恢复真的把它拉回来了
+        let later = UNIX_EPOCH + StdDuration::from_secs(1_700_000_000);
+        crate::apply::set_fs_times(&p, later, later, later).unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().modified().unwrap(), later);
+
+        let report = restore(&bpath.to_string_lossy());
+        assert_eq!(report.len(), 1);
+        assert!(report[0].1.is_ok(), "{:?}", report[0].1);
+        assert_eq!(std::fs::metadata(&p).unwrap().modified().unwrap(), t0);
+
+        // 沙箱里删除可能失败，忽略即可（临时目录自己会清）
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&bpath);
+    }
+
+    /// 备份文件损坏时要报错而不是 panic —— 用户点「恢复…」选错文件很常见。
+    #[test]
+    fn broken_backup_is_reported_not_panicking() {
+        let p = unique("bad", "json");
+        std::fs::write(&p, b"{ not json").unwrap();
+        let r = restore(&p.to_string_lossy());
+        assert_eq!(r.len(), 1);
+        assert!(r[0].1.is_err());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn missing_backup_file_is_reported() {
+        let r = restore("Z:/definitely/not/here.json");
+        assert_eq!(r.len(), 1);
+        assert!(r[0].1.is_err());
+    }
+}

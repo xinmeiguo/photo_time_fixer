@@ -9,7 +9,7 @@ use chrono::{DateTime, Local, NaiveDateTime, Utc};
 
 use crate::exiftool;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MediaKind {
     Photo,
     Video,
@@ -34,11 +34,27 @@ pub struct MediaFile {
     pub original_modified: Option<NaiveDateTime>,
 }
 
+impl MediaFile {
+    /// 预览表里「原时间」列的显示文本：
+    /// 优先拍摄时间（元数据），其次文件修改时间，都没有就显示破折号。
+    pub fn original_display(&self) -> String {
+        if let Some(t) = &self.original_taken {
+            t.clone()
+        } else if let Some(d) = self.original_modified {
+            d.format("%Y-%m-%d %H:%M:%S").to_string()
+        } else {
+            "—".into()
+        }
+    }
+}
+
 const PHOTO_EXT: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "bmp", "tif", "tiff", "webp", "heic", "avif",
 ];
 const VIDEO_EXT: &[&str] = &[
-    "mp4", "mov", "avi", "mkv", "wmv", "flv", "m4v", "mpg", "mpeg", "3gp",
+    // 注意：这里必须覆盖「视频格式转换」页所有可选的目标格式，
+    // 否则能选出来的格式却扫不到同类输入（webm 曾经就是这样漏掉的）。
+    "mp4", "mov", "avi", "mkv", "webm", "wmv", "flv", "m4v", "mpg", "mpeg", "3gp",
 ];
 
 fn kind_of(ext: &str) -> Option<MediaKind> {
@@ -117,5 +133,60 @@ fn collect_candidates(dir: &Path, recursive: bool, out: &mut Vec<(PathBuf, Strin
                 .to_string();
             out.push((path, name, kind));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 转换页下拉框里能选的目标格式，扫描时必须都能识别。
+    /// 这条测试就是为 webm 曾经漏在 VIDEO_EXT 外而加的。
+    #[test]
+    fn convert_targets_are_all_recognized() {
+        for ext in ["mp4", "mkv", "mov", "avi", "webm", "flv", "m4v"] {
+            assert_eq!(
+                kind_of(ext),
+                Some(MediaKind::Video),
+                "转换目标格式 {ext} 未被识别为视频"
+            );
+        }
+    }
+
+    #[test]
+    fn extension_match_is_case_insensitive() {
+        assert_eq!(kind_of("JPG"), Some(MediaKind::Photo));
+        assert_eq!(kind_of("HeIc"), Some(MediaKind::Photo));
+        assert!(is_video_ext("WEBM"));
+        assert!(is_video_ext("Mp4"));
+    }
+
+    #[test]
+    fn irrelevant_extension_is_ignored() {
+        assert_eq!(kind_of("txt"), None);
+        assert_eq!(kind_of(""), None);
+        assert!(!is_video_ext("jpg"));
+    }
+
+    /// 预览表「原时间」列：拍摄时间 > 文件修改时间 > 破折号。
+    #[test]
+    fn original_display_prefers_taken_time() {
+        let mut f = MediaFile {
+            path: PathBuf::from("a.jpg"),
+            name: "a.jpg".into(),
+            kind: MediaKind::Photo,
+            original_taken: Some("2020:01:01 10:00:00".into()),
+            original_modified: None,
+        };
+        assert_eq!(f.original_display(), "2020:01:01 10:00:00");
+
+        f.original_taken = None;
+        f.original_modified = Some(
+            NaiveDateTime::parse_from_str("2021-02-02 11:00:00", "%Y-%m-%d %H:%M:%S").unwrap(),
+        );
+        assert_eq!(f.original_display(), "2021-02-02 11:00:00");
+
+        f.original_modified = None;
+        assert_eq!(f.original_display(), "—");
     }
 }

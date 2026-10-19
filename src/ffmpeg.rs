@@ -4,6 +4,7 @@
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// 转换模式：仅封装(不重编码) 或 重新编码(H.264/AAC)。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -119,12 +120,13 @@ fn exe_dir() -> Option<PathBuf> {
 /// ffmpeg 是动态链接版，运行时依赖同目录的 av*.dll 等，因此需把整个 bin/ 目录
 /// （ffmpeg.exe + 依赖 dll）一并解压到 tools/，否则运行会缺库失败。
 /// 返回解压后的 exe 路径。
-pub fn download_and_install(dir: &Path) -> Result<PathBuf, String> {
+pub fn download_and_install(
+    dir: &Path,
+    sink: crate::download::ProgressSink,
+) -> Result<PathBuf, String> {
     let url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
-    let bytes = reqwest::blocking::get(url)
-        .map_err(|e| format!("下载失败: {e}"))?
-        .bytes()
-        .map_err(|e| format!("读取下载内容失败: {e}"))?;
+    let bytes = crate::download::fetch(url, &mut *sink)?;
+    crate::download::notify_extracting(sink, 1);
 
     let tools_dir = dir.join("tools");
     std::fs::create_dir_all(&tools_dir).map_err(|e| format!("创建目录失败: {e}"))?;
@@ -196,19 +198,19 @@ pub fn output_path(input: &Path, target_ext: &str, out_dir: Option<&Path>) -> Pa
     out
 }
 
-/// 转换单个文件。
-/// 返回 `Ok(元数据状态描述)` / `Err(错误)`。
+/// 单个文件的**转码**阶段：只跑 ffmpeg，不碰元数据、不碰文件时间。
 ///
-/// 元数据保留做**两道**：
-/// 1. ffmpeg 侧 `-map_metadata 0`（全局+流级元数据、章节整体搬运）；
-/// 2. 转换后用 exiftool `-TagsFromFile` 把源文件**全部 tag** 深度复制过去。
-///    第 2 道是“EXIF 一点都不丢”的关键——ffmpeg 的 mp4 muxer 会丢掉一部分非标准 tag。
-pub fn convert_one(
+/// 为什么拆开：元数据复制要调用 exiftool，而 exiftool 每启动一次就是
+/// 几十到上百毫秒（还要写参数文件）。几十个文件逐个调用纯属浪费。
+/// 现在改成「整批转完 → 一次 exiftool 复制全部元数据 → 逐文件还原时间」，
+/// 见 `finalize_batch`。
+pub fn encode_one(
     ff: &Path,
     input: &Path,
     output: &Path,
     spec: &ConvertSpec,
-) -> Result<String, String> {
+    cancel: Option<&AtomicBool>,
+) -> Result<(), String> {
     // 兜底：绝不允许把输出写到输入自身。ffmpeg 会拒绝执行，
     // 更糟的是若中途失败会留下被截断的原文件。
     if is_same_path(output, input) {
@@ -309,10 +311,49 @@ pub fn convert_one(
         }
     }
     cmd.arg(output);
+    cmd.stdout(Stdio::null());
 
-    let out = cmd.output().map_err(|e| format!("执行 ffmpeg 失败: {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
+    // stderr 落到临时文件而不是管道：ffmpeg 的进度/警告输出量很大，管道写满而
+    // 父进程不读时会死锁；写文件既避免死锁，也让「取消」能安全杀掉子进程后再读日志。
+    let err_path = std::env::temp_dir().join(format!(
+        "ptf_ff_{}_{}.log",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let err_file =
+        std::fs::File::create(&err_path).map_err(|e| format!("创建 ffmpeg 日志失败: {e}"))?;
+    cmd.stderr(Stdio::from(err_file));
+
+    let mut child = cmd.spawn().map_err(|e| format!("执行 ffmpeg 失败: {e}"))?;
+    let status = loop {
+        if let Some(flag) = cancel {
+            if flag.load(Ordering::Relaxed) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&err_path);
+                // 杀进程会留下半截输出文件，必须删掉；否则用户重跑时会撞上
+                // 「输出文件已存在」而搞不清这文件是谁留下的。
+                let _ = std::fs::remove_file(output);
+                return Err("已取消".into());
+            }
+        }
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(150)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = std::fs::remove_file(&err_path);
+                return Err(format!("等待 ffmpeg 结束失败: {e}"));
+            }
+        }
+    };
+    let err = std::fs::read_to_string(&err_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&err_path);
+
+    if !status.success() {
         // 优先取含关键词的错误行，其次取最后一行非空内容
         let key = err
             .lines()
@@ -335,29 +376,47 @@ pub fn convert_one(
         };
     }
 
-    // ── 第二道：exiftool 深度复制全部元数据 ──
-    let mut status = if !spec.keep_metadata {
+    // 转码完成。元数据与文件时间统一由 `finalize_batch` 在整批转完后处理。
+    Ok(())
+}
+
+/// 一个已转码完成、等待收尾的文件。
+#[derive(Clone)]
+pub struct Encoded {
+    pub input: PathBuf,
+    pub output: PathBuf,
+}
+
+/// 一批文件的收尾：**一次** exiftool 复制全部元数据，然后逐文件还原文件系统时间。
+///
+/// 返回 `(元数据说明, 每个文件的时间还原结果)`。两者要分开返回：
+/// 元数据的结果对整批是同一句话（日志只报一次），时间还原则可能个别失败。
+///
+/// 顺序不能反：`exiftool -overwrite_original` 会重写文件，把修改时间刷成“现在”，
+/// 所以时间必须在元数据**之后**设。
+pub fn finalize_batch(items: &[Encoded], keep_metadata: bool) -> (String, Vec<Result<(), String>>) {
+    let meta_note = if !keep_metadata {
         String::new()
     } else if crate::exiftool::exiftool_path().is_none() {
         "元数据：已由 ffmpeg 保留（未装 exiftool，未做深度复制）".to_string()
     } else {
-        match copy_metadata_from_source(input, output) {
-            Ok(()) => "元数据：已完整保留（ffmpeg + exiftool）".to_string(),
+        let pairs: Vec<(PathBuf, PathBuf)> = items
+            .iter()
+            .map(|i| (i.input.clone(), i.output.clone()))
+            .collect();
+        match crate::exiftool::copy_metadata_batch(&pairs) {
+            Ok(()) => format!(
+                "元数据：已完整保留（ffmpeg + exiftool 批量复制 {} 个）",
+                pairs.len()
+            ),
             Err(e) => format!("元数据：ffmpeg 已保留，exiftool 深度复制失败({e})"),
         }
     };
-
-    // ── 第三道：还原文件系统时间戳（创建 / 修改 / 访问）──
-    // ffmpeg 写新文件、exiftool 的 -overwrite_original 重写文件，都会把
-    // 修改时间刷成“现在”。必须放在元数据复制**之后**，否则前脚设好后脚又被覆盖。
-    if !status.is_empty() {
-        status.push_str("；");
-    }
-    match copy_fs_times(input, output) {
-        Ok(()) => status.push_str("文件时间：已还原为原文件时间"),
-        Err(e) => status.push_str(&format!("文件时间还原失败({e})")),
-    }
-    Ok(status)
+    let times = items
+        .iter()
+        .map(|i| copy_fs_times(&i.input, &i.output))
+        .collect();
+    (meta_note, times)
 }
 
 /// 把源文件的文件系统时间戳（创建 / 修改 / 访问）复制到目标文件。
@@ -374,47 +433,43 @@ fn copy_fs_times(src: &Path, dst: &Path) -> Result<(), String> {
         .map_err(|e| format!("设置文件时间失败: {e}"))
 }
 
-/// 用 exiftool 把 `src` 的全部元数据复制到 `dst`
-/// （拍摄时间、设备型号、GPS、自定义标签等一并保留）。
-fn copy_metadata_from_source(src: &Path, dst: &Path) -> Result<(), String> {
-    let exep = crate::exiftool::exiftool_path().ok_or_else(|| "未找到 exiftool".to_string())?;
-    // 走 UTF-8 参数文件，避免 Windows 命令行对 Unicode 路径的编码问题
-    let lines = [
-        "-m".to_string(), // 忽略次要错误（少数 tag 不可写）
-        "-overwrite_original".to_string(),
-        "-TagsFromFile".to_string(),
-        src.to_string_lossy().to_string(),
-        "-all:all".to_string(),
-        "-unsafe".to_string(),
-        dst.to_string_lossy().to_string(),
-    ];
-    let argfile = std::env::temp_dir().join(format!(
-        "ptf_meta_{}_{}.args",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0)
-    ));
-    std::fs::write(&argfile, lines.join("\n")).map_err(|e| format!("写入参数文件失败: {e}"))?;
-    let out = Command::new(&exep)
-        .arg("-charset")
-        .arg("filename=UTF8")
-        .arg("-@")
-        .arg(&argfile)
-        .output();
-    let _ = std::fs::remove_file(&argfile);
-    let out = out.map_err(|e| format!("执行 exiftool 失败: {e}"))?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        let err = String::from_utf8_lossy(&out.stderr);
-        Err(err
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .last()
-            .unwrap_or("未知错误")
-            .trim()
-            .to_string())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_path_switches_extension() {
+        let out = output_path(
+            Path::new(r"D:\clips\a.mov"),
+            "mp4",
+            Some(Path::new(r"D:\clips\out")),
+        );
+        assert_eq!(norm_path(&out), norm_path(Path::new(r"D:\clips\out\a.mp4")));
+    }
+
+    /// mp4 → mp4 且不指定输出目录时，换扩展名得到的路径就是输入自身。
+    /// 必须自动改名，否则 ffmpeg 直接拒绝（报 Error opening output file）。
+    #[test]
+    fn same_extension_does_not_overwrite_source() {
+        let input = Path::new(r"D:\clips\a.mp4");
+        let out = output_path(input, "mp4", None);
+        assert!(!is_same_path(&out, input));
+        assert_eq!(
+            norm_path(&out),
+            norm_path(Path::new(r"D:\clips\a_converted.mp4"))
+        );
+    }
+
+    /// Windows 路径大小写不敏感、分隔符可能混用，比较前必须归一化。
+    #[test]
+    fn path_compare_ignores_case_and_separator() {
+        assert!(is_same_path(
+            Path::new(r"D:\A\b.mp4"),
+            Path::new("D:/a/B.MP4")
+        ));
+        assert!(!is_same_path(
+            Path::new(r"D:\a\b.mp4"),
+            Path::new(r"D:\a\c.mp4")
+        ));
     }
 }
