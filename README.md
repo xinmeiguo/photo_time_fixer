@@ -62,7 +62,7 @@ cargo build --release
 
 **[下载最新版 photo_time_fixer.exe](https://github.com/xinmeiguo/photo_time_fixer/releases/latest)**
 
-编译好的 exe **不随仓库提交**（约 28 MB，会让仓库臃肿），请从 Releases 下载。
+编译好的 exe **不随仓库提交**（约 8 MB，会让仓库臃肿），请从 Releases 下载。
 双击即可运行，无需安装任何运行库。
 
 首次使用时，如果电脑没有 exiftool / ffmpeg，点界面顶部的对应按钮即可自动下载到程序同级的 `tools/` 目录。

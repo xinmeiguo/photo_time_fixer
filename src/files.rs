@@ -107,7 +107,9 @@ pub fn scan(dir: &Path, recursive: bool) -> Vec<MediaFile> {
             original_modified: om,
         });
     }
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    // 用 sort_by_cached_key：大小写无关排序，但每个名字只转一次小写
+    //（sort_by 会在每次比较里各分配两个 String）。
+    out.sort_by_cached_key(|a| a.name.to_lowercase());
     out
 }
 

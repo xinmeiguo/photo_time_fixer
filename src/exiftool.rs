@@ -336,8 +336,7 @@ fn batch_argfile_lines(pairs: &[(PathBuf, PathBuf)]) -> Vec<String> {
 fn last_line(raw: &[u8]) -> String {
     String::from_utf8_lossy(raw)
         .lines()
-        .filter(|l| !l.trim().is_empty())
-        .last()
+        .rfind(|l| !l.trim().is_empty())
         .unwrap_or("未知错误")
         .trim()
         .to_string()

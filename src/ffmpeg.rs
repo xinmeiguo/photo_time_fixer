@@ -363,7 +363,7 @@ pub fn encode_one(
                     || l.contains("Could not find tag")
                     || l.contains("Invalid")
             })
-            .or_else(|| err.lines().filter(|l| !l.trim().is_empty()).last())
+            .or_else(|| err.lines().rfind(|l| !l.trim().is_empty()))
             .unwrap_or("未知错误")
             .trim()
             .to_string();

@@ -60,9 +60,9 @@ pub fn compute_plan(files: &[MediaFile], input: &PlanInput) -> Vec<PlanItem> {
                     file: f.clone(),
                     new_time: cursor,
                 });
-                cursor = cursor + Duration::minutes(input.interval_min as i64);
+                cursor += Duration::minutes(input.interval_min as i64);
                 if input.random {
-                    cursor = cursor + Duration::seconds(rng.gen_range(0..=59));
+                    cursor += Duration::seconds(rng.gen_range(0..=59));
                 }
             }
         }
