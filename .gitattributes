@@ -1,0 +1,11 @@
+# 源码统一用 LF 存进仓库，避免 Windows 与 Linux 之间反复出现整文件 diff
+* text=auto eol=lf
+
+# 二进制资源：绝不能做换行转换，否则图标/像素数据会被破坏
+*.ico   binary
+*.png   binary
+*.rgba  binary
+*.exe   binary
+
+# Windows 资源脚本按 CRLF 更稳妥（windres 两种都能读，但社区习惯如此）
+*.rc text eol=crlf

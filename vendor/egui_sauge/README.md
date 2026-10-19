@@ -1,0 +1,127 @@
+# egui_sauge
+
+[![CI](https://github.com/macnjil4/egui_sauge/actions/workflows/rust.yml/badge.svg)](https://github.com/macnjil4/egui_sauge/actions/workflows/rust.yml)
+[![crates.io](https://img.shields.io/crates/v/egui_sauge.svg)](https://crates.io/crates/egui_sauge)
+[![docs.rs](https://img.shields.io/docsrs/egui_sauge)](https://docs.rs/egui_sauge)
+[![License](https://img.shields.io/crates/l/egui_sauge.svg)](LICENSE)
+[![MSRV](https://img.shields.io/badge/MSRV-1.92-blue)](https://www.rust-lang.org)
+
+A fresh, natural design system for [egui](https://github.com/emilk/egui) — sage palette, warm neutrals, WCAG AA contrast, and a ready-to-use component library aimed at IT applications.
+
+```rust
+use eframe::egui;
+use egui_sauge::{Palette, Density, Locale, apply_theme_with, install_fonts, set_locale};
+use egui_sauge::components::{Button, Card, Section};
+
+fn main() -> eframe::Result<()> {
+    eframe::run_native(
+        "My app",
+        eframe::NativeOptions::default(),
+        Box::new(|cc| {
+            install_fonts(&cc.egui_ctx);
+            apply_theme_with(&cc.egui_ctx, &Palette::light(), Density::Comfortable);
+            set_locale(&cc.egui_ctx, Locale::En); // or Locale::Fr
+            Ok(Box::new(MyApp::default()) as Box<dyn eframe::App>)
+        }),
+    )
+}
+```
+
+## What's in the box
+
+**Theme**
+- 20-role semantic palette (light + dark, both WCAG AA validated).
+- 4-pt spacing scale, 5-step radius scale, 4-level elevation with real shadows.
+- Density preset (`Comfortable` / `Compact`).
+- Locale (`En` / `Fr`) for the strings the design system itself emits.
+- ~80 named icons backed by [Phosphor](https://phosphoricons.com/), plus `Icon::Glyph` and `Icon::Custom` escape hatches.
+
+**Components** (`egui_sauge::components`)
+
+| Group | Items |
+|---|---|
+| **Workbench (2.0)** | `Workbench` (IDE-style shell), `ActivityBar` (icon-only nav rail), `StatusBar` (3-slot footer + segments), `Splitter` (resizable panel), `TreeView<T>` (file tree), `EditorTabs<T>` (file tabs with modified dot + close ×) |
+| Buttons | `Button` (Primary / Secondary / Ghost / Danger × Sm / Md / Lg, leading & trailing icons), `IconButton` (with tooltip) |
+| Status & badges | `Badge`, `Tag` (closable), `StatusDot` (online / degraded / offline / idle, pulse), `Kbd`, `Avatar` / `AvatarGroup` (initials / icon / image, status dot) |
+| Feedback | `Spinner`, `ProgressBar`, `Alert`, `Toast` / `Toasts` (auto-dismiss stack) |
+| Charts | `Sparkline` (line / bars / area), `Gauge` (ring / bar, threshold-aware) |
+| Containers | `Card`, `Section`, `EmptyState`, `Stat` (with trend), `CodeBlock`, `Accordion` |
+| Forms | `InputField` (label / helper / error / icons / password), `SelectField`, `Switch`, `Checkbox` (with indeterminate), `RadioGroup<T>`, `NumberField` (stepper, suffix, min/max) |
+| Overlays | `Dialog`, `ConfirmDialog`, `Drawer`, `CommandPalette` (⌘K, fuzzy search, keyboard nav), `MenuItem`, `SubMenu` (nests arbitrarily deep), `tooltip(...)` / `TooltipExt` |
+| Navigation | `NavItem`, `Tabs<T>`, `Breadcrumb`, `PageHeader` |
+| Data | `Table<T>` (typed columns, sortable, selectable), `Pagination`, `KeyValue`, `LogLine` (timestamped, level-colored), `Timeline`, `DiffView`, `Skeleton` |
+
+See `GUIDE.md` for the **UX/UI playbook** — page composition, when to use each navigation pattern, modal vs side panel, button order, typography hierarchy, accessibility checklist, IT-app patterns.
+
+## Live demos
+
+```bash
+cargo run --example showcase    # every component, all densities + locales
+cargo run --example workbench   # IDE-style layout: activity rails, file
+                                # tree, editor tabs, terminal, status bar
+```
+
+## Adding to your project
+
+The crate is not yet on crates.io. Pick the option that fits your workflow:
+
+```toml
+# Option 1 — local path (during development)
+egui_sauge = { path = "../egui_sauge" }
+
+# Option 2 — git
+egui_sauge = { git = "https://github.com/macnjil4/egui_sauge", tag = "v2.0.0" }
+
+# Option 3 — crates.io (once published)
+egui_sauge = "2.0"
+
+# In all cases, your egui must match egui_sauge's pinned version:
+egui   = "0.34"
+eframe = "0.34"
+```
+
+## Compatibility
+
+| egui_sauge | egui    | eframe  | rustc (MSRV) | edition |
+| ---------- | ------- | ------- | ------------ | ------- |
+| 1.x        | 0.34.x  | 0.34.x  | 1.92         | 2024    |
+
+## Fonts
+
+`install_fonts` installs the typographic scale and registers the Phosphor icon font. UI text uses egui's bundled fonts.
+
+If you want a custom UI typeface (Inter, JetBrains Mono, your brand font…), embed it at the application level *before* calling `install_fonts`:
+
+```rust
+use std::sync::Arc;
+use egui::{FontData, FontDefinitions, FontFamily};
+
+let mut fonts = FontDefinitions::default();
+fonts.font_data.insert(
+    "Inter".into(),
+    Arc::new(FontData::from_static(include_bytes!("../assets/Inter-Regular.ttf"))),
+);
+fonts
+    .families
+    .entry(FontFamily::Proportional)
+    .or_default()
+    .insert(0, "Inter".into());
+
+egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+ctx.set_fonts(fonts);
+egui_sauge::install_fonts(ctx); // sets the type scale
+```
+
+Inter and JetBrains Mono are both SIL OFL 1.1 and redistributable — drop the TTFs in your own assets directory.
+
+## i18n
+
+`egui_sauge` does not ship a full i18n runtime — only the ~6 strings it owns (default `ConfirmDialog` buttons, `StatusDot` labels) are translated, currently `En` (default) and `Fr`. For your application's strings, plug in any i18n crate you like (`fluent`, `rust-i18n`, …). See `GUIDE.md` § Internationalisation.
+
+## Status
+
+Stable. Following semver — breaking changes will land in 2.0.
+
+## License
+
+Apache-2.0

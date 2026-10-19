@@ -1,0 +1,18 @@
+# GNU 工具链（见 rust-toolchain.toml）的构建参数。
+#
+# 注意：这里**不写 target-dir**。开发机上项目位于含中文的路径，需要把
+# target 放到纯 ASCII 目录（否则 windres / gcc 会因为代码页问题把路径打成乱码），
+# 但那是本机环境差异，不该固化进仓库。本机开发时用环境变量：
+#
+#   CARGO_TARGET_DIR=D:/ptf-target cargo build --release
+
+[env]
+# 跳过 proc-macro2 的编译器能力探测：它会在 build.rs 里建 $OUT_DIR/probe、
+# 编一个探测程序再删掉，在限制删除的环境（如本机沙箱）里清理失败会直接
+# 让整条依赖链编译中断。探测结论在 rustc >= 1.88 上恒为真，跳过是安全的。
+# 普通开发机可以删掉这一行。
+RUSTC_STAGE = "1"
+
+# 静态链接 mingw 运行时：产物单文件，目标机器无需装任何 C++ 运行库。
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "target-feature=+crt-static"]

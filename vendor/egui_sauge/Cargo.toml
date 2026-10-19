@@ -1,0 +1,50 @@
+# ⚠ 这是 vendored（内置）副本，不是本仓库自己的代码。
+#
+# 上游：https://github.com/macnjil4/egui_sauge  tag v2.0.0（Apache-2.0，见 LICENSE）
+# 本副本：https://github.com/xinmeiguo/egui_sauge  095ae21
+#         相对上游只做了浮点字面量补 `_f32` 后缀（74 处，语义零变化），
+#         详见同目录 FORK-NOTES.md。
+#
+# 为什么内置而不是用 git 依赖：保证 clone 后无需联网、无需额外仓库权限即可编译，
+# 且版本永久固定。升级方式：把上游 src/ 整个覆盖到本目录，再重放 FORK-NOTES.md 里的补丁。
+#
+# 相对上游只删掉了 [dev-dependencies]（examples/ 与 tests/ 未随本副本一起引入）。
+
+[package]
+name = "egui_sauge"
+version = "2.0.0"
+edition = "2024"
+rust-version = "1.92"
+authors = ["egui_sauge contributors"]
+description = "A fresh, natural design system for egui — sage palette, warm neutrals, WCAG AA."
+repository = "https://github.com/macnjil4/egui_sauge"
+homepage = "https://github.com/macnjil4/egui_sauge"
+documentation = "https://docs.rs/egui_sauge"
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["egui", "design-system", "theme", "ui", "accessibility"]
+categories = ["gui", "visualization"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+egui = "0.34"
+egui-phosphor = "0.12"
+
+[features]
+default = []
+# Enable extra Phosphor weight variants. Each turns on the corresponding
+# feature on `egui-phosphor`, exposing constants like
+# `egui_phosphor::bold::ROCKET`, plus the [`Variant::Bold`] enum value
+# you can pass to [`crate::install_phosphor_variant`] to register the
+# font on your `Context`. Use them through `Icon::Glyph(...)`.
+icons-bold = ["egui-phosphor/bold"]
+icons-fill = ["egui-phosphor/fill"]
+icons-light = ["egui-phosphor/light"]
+icons-thin = ["egui-phosphor/thin"]
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"

@@ -1,0 +1,9 @@
+# 锁定 GNU（mingw-w64）工具链。
+#
+# 原因：本项目的 Windows 资源节（图标 + 版本信息）由 build.rs 调 mingw 的
+# `windres` 编译，运行时靠 `+crt-static` 静态链接 mingw 库，产物才能是
+# 「只依赖系统 DLL」的单文件 exe。MSVC 工具链需改用 rc.exe，本仓库未提供该路径。
+#
+# 若你的机器没有 MSVC Build Tools，走 GNU 是最省事的选择，无需安装任何 VS 组件。
+[toolchain]
+channel = "stable-x86_64-pc-windows-gnu"

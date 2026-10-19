@@ -1,0 +1,19 @@
+# Rust 构建产物
+/target
+
+# 本地打包的可执行文件（体积大，改用 GitHub Releases 分发）
+/dist
+
+# 自动下载的第三方工具（exiftool / ffmpeg 解压到这里）
+/tools
+
+# 运行期产物
+undo_*.json
+.ptf_write_test
+
+# 编辑器与系统文件
+.vscode/
+.idea/
+*.pdb
+.DS_Store
+Thumbs.db
