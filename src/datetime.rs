@@ -1,8 +1,25 @@
 //! 灵活日期时间解析：支持任意常见格式，包含中文（年月日 / 上午下午 / 点分秒）。
 //! 解析结果统一为 `NaiveDateTime`（本地墙钟时间），时区偏移由调用方处理。
 
-use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
+use chrono::{
+    DateTime, Duration, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc,
+};
 use std::str::FromStr;
+
+/// 本地墙钟时间 + 固定偏移 → 带时区的时间。
+///
+/// 不用 `dt.and_local_timezone(offset).expect(..)`：那个 `expect` 在 FixedOffset 下
+/// 理论上不可达，但一旦触发就是整个后台处理线程 panic 掉（进度条永远停在半路，
+/// 而且用户看不到任何报错）。这里改成纯算术换算，不产生 panic 分支。
+///
+/// FixedOffset 没有夏令时，等价关系很直接：UTC = 本地墙钟 − 偏移。
+pub fn with_offset(dt: NaiveDateTime, offset: FixedOffset) -> DateTime<FixedOffset> {
+    let utc_secs = dt.and_utc().timestamp() - offset.local_minus_utc() as i64;
+    DateTime::from_timestamp(utc_secs, 0)
+        .map(|t| t.with_timezone(&offset))
+        // 只有超出 chrono 可表示范围（±26 万年）才走到这里，退回 1970 也好过崩掉线程
+        .unwrap_or_else(|| DateTime::<Utc>::UNIX_EPOCH.with_timezone(&offset))
+}
 
 /// 将全角数字/标点转半角，避免中文输入导致解析失败。
 fn normalize_fullwidth(s: &str) -> String {

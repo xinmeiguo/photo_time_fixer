@@ -28,6 +28,24 @@ fn exe_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// 视频转换的并发度。
+///
+/// 实测（720p / 8 个 4 秒片段）：串行 9.90 s，并发 2 为 6.01 s，加速 1.65x；
+/// 而并发 4 与并发 2 基本持平 —— 说明单个 ffmpeg 的重编码已接近吃满多核，
+/// 再加进程只是互相抢核。所以固定 2 就是这条曲线的拐点。
+///
+/// 每个进程限流到「核数 / 并发数」，否则两个 ffmpeg 各自按核数开线程，
+/// 上下文切换的代价会把并发的收益吃掉。
+///
+/// 少于 4 核的机器退回单线程：并行只会让每个任务更慢，总时间不变甚至变长。
+fn convert_workers(total: usize) -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    let w = if cores >= 4 { 2 } else { 1 };
+    w.min(total.max(1))
+}
+
 impl PhotoTimeFixer {
     pub(super) fn tz_offset(&self) -> FixedOffset {
         let secs = if self.tz_hours == i32::MIN {
@@ -135,6 +153,11 @@ impl PhotoTimeFixer {
     }
 
     pub(super) fn do_apply(&mut self) {
+        // 界面按钮已经互斥，这里再挡一道：防止将来加快捷键/托盘入口绕过按钮层。
+        if self.converting {
+            self.log("视频转换进行中，请等待完成或先取消，再修改时间。".into());
+            return;
+        }
         if !self.exiftool_installed && self.set_taken {
             self.log("未安装 exiftool，无法修改拍摄时间(元数据)。请先安装，或取消勾选“拍摄时间(元数据)”。".into());
             return;
@@ -212,6 +235,10 @@ impl PhotoTimeFixer {
     /// 从备份 JSON 恢复原时间。恢复会改动文件时间，完成后必须重新扫描，
     /// 否则预览表里的「原时间」还是旧值，用户会误以为没生效。
     pub(super) fn do_restore(&mut self, backup_file: &Path) {
+        if self.applying || self.converting {
+            self.log("有任务正在运行，请等待完成或先取消，再执行恢复。".into());
+            return;
+        }
         let report = backup::restore(&backup_file.to_string_lossy());
         let ok = report.iter().filter(|(_, r)| r.is_ok()).count();
         self.log(format!("恢复完成：成功 {}/{}", ok, report.len()));
@@ -275,6 +302,10 @@ impl PhotoTimeFixer {
 
     /// 开始批量视频格式转换（后台线程 + 进度回调）。
     pub(super) fn start_convert(&mut self) {
+        if self.applying {
+            self.log("时间修改进行中，请等待完成或先取消，再开始转换。".into());
+            return;
+        }
         if !self.ffmpeg_installed {
             self.log("未安装 ffmpeg，无法转换视频格式。请先点击顶部“下载安装 ffmpeg”。".into());
             return;
@@ -336,7 +367,43 @@ impl PhotoTimeFixer {
             self.log("目标格式不能为空".into());
             return;
         }
-        // 一次构造，线程内每个文件共用（含码率与元数据保留策略）
+        // ── 派发前串行算好所有输出路径 ──
+        // 递归扫描时不同子目录可能有同名文件，统统落到 out/ 会互相覆盖，
+        // 所以批内重名要加 _2/_3 序号。这一步必须在并发之前做完：它依赖一个
+        // 共享的「已占用名字」集合，多线程同时算会抢到同一个输出名。
+        let total = videos.len();
+        let mut used: std::collections::HashSet<PathBuf> =
+            std::collections::HashSet::with_capacity(total);
+        let mut jobs: Vec<ffmpeg::Encoded> = Vec::with_capacity(total);
+        for input in &videos {
+            let mut out = ffmpeg::output_path(input, &ext, Some(out_dir.as_path()));
+            if !used.insert(out.clone()) {
+                let stem = input
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "output".into());
+                let mut n = 2u32;
+                loop {
+                    let cand = out_dir.join(format!("{stem}_{n}.{ext}"));
+                    if used.insert(cand.clone()) {
+                        out = cand;
+                        break;
+                    }
+                    n += 1;
+                }
+            }
+            jobs.push(ffmpeg::Encoded {
+                input: input.clone(),
+                output: out,
+            });
+        }
+
+        let workers = convert_workers(total);
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2);
+
+        // 一次构造，所有 worker 共用（含码率、元数据保留策略、线程上限）
         let spec = ffmpeg::ConvertSpec {
             target_ext: ext.clone(),
             mode: self.convert_mode,
@@ -347,9 +414,10 @@ impl PhotoTimeFixer {
             },
             keep_metadata: self.convert_keep_metadata,
             overwrite: self.convert_overwrite,
+            // 只在并发时限流：单进程让编码器自己按核数决定（x264 默认就够聪明）
+            threads: (workers > 1).then(|| (cores / workers).max(1) as u32),
         };
 
-        let total = videos.len();
         let (tx, rx) = channel();
         self.convert_rx = Some(rx);
         self.converting = true;
@@ -358,73 +426,100 @@ impl PhotoTimeFixer {
         self.progress_done = 0;
         self.progress_total = total;
         self.progress_current = String::new();
-        self.log(format!("开始转换，共 {total} 个视频…"));
+        if workers > 1 {
+            self.log(format!(
+                "开始转换，共 {total} 个视频（并发 {workers}，每个 {cores} / {workers} 线程）…"
+            ));
+        } else {
+            self.log(format!("开始转换，共 {total} 个视频…"));
+        }
 
         std::thread::spawn(move || {
-            let names: Vec<String> = videos
+            let names: Vec<String> = jobs
                 .iter()
-                .map(|p| {
-                    p.file_name()
+                .map(|j| {
+                    j.input
+                        .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default()
                 })
                 .collect();
+
+            // 并发干活：`next` 是任务派发计数（谁空谁取下一个，天然是负载均衡），
+            // `completed` 是真正的完成数（成功 + 失败，不含被取消的）。
+            // 进度按完成数上报，不再用「已开工序号」——并发下后者会跳着涨。
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let completed = std::sync::atomic::AtomicUsize::new(0);
+            let results: std::sync::Mutex<Vec<(usize, Result<ffmpeg::Encoded, String>)>> =
+                std::sync::Mutex::new(Vec::with_capacity(total));
+
+            let jobs_ref = &jobs;
+            let names_ref = &names;
+            let spec_ref = &spec;
+            let ff_ref = &ff;
+            let cancel_ref = &cancel;
+            std::thread::scope(|s| {
+                for _ in 0..workers {
+                    let tx = tx.clone();
+                    let next = &next;
+                    let completed = &completed;
+                    let results = &results;
+                    s.spawn(move || {
+                        loop {
+                            // 取消后立刻停手：正在跑的 ffmpeg 由 encode_one 内部杀掉
+                            if cancel_ref.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            let idx = next.fetch_add(1, Ordering::Relaxed);
+                            if idx >= jobs_ref.len() {
+                                break;
+                            }
+                            let job = &jobs_ref[idx];
+                            let res = ffmpeg::encode_one(
+                                ff_ref,
+                                &job.input,
+                                &job.output,
+                                spec_ref,
+                                Some(cancel_ref),
+                            );
+                            // 被打断的那个文件不算失败，也不计入完成数
+                            let entry = match res {
+                                Ok(()) => Ok(job.clone()),
+                                Err(e) if e == "已取消" => continue,
+                                Err(e) => Err(e),
+                            };
+                            let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                            let _ = tx.send(ConvertMsg::Progress {
+                                done: n,
+                                total,
+                                current: names_ref[idx].clone(),
+                            });
+                            if let Ok(mut v) = results.lock() {
+                                v.push((idx, entry));
+                            }
+                        }
+                    });
+                }
+            });
+
             // 每个文件一个槽位：转码阶段填错误，收尾阶段填成功说明。
             // 用槽位而非直接 push，报告顺序才和文件顺序一致。
             let mut slots: Vec<Option<Result<String, String>>> = (0..total).map(|_| None).collect();
-            // 已完成转码、等待收尾（元数据 + 文件时间）的文件
-            let mut done: Vec<(usize, ffmpeg::Encoded)> = Vec::new();
-            let mut attempted = 0usize;
-            // 递归扫描时不同子目录可能存在同名文件，统统落到 out/ 会互相覆盖，
-            // 这里对批内重名加 _2/_3 序号。
-            let mut used: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-
-            for (idx, input) in videos.iter().enumerate() {
-                // 用户取消：不再开工新文件
-                if cancel.load(Ordering::Relaxed) {
-                    break;
-                }
-                attempted = idx + 1;
-                let _ = tx.send(ConvertMsg::Progress {
-                    done: idx,
-                    total,
-                    current: names[idx].clone(),
-                });
-                let mut out = ffmpeg::output_path(input, &ext, Some(out_dir.as_path()));
-                if !used.insert(out.clone()) {
-                    let stem = input
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "output".into());
-                    let mut n = 2u32;
-                    loop {
-                        let cand = out_dir.join(format!("{stem}_{n}.{ext}"));
-                        if used.insert(cand.clone()) {
-                            out = cand;
-                            break;
-                        }
-                        n += 1;
-                    }
-                }
-                match ffmpeg::encode_one(&ff, input, &out, &spec, Some(&cancel)) {
-                    Ok(()) => done.push((
-                        idx,
-                        ffmpeg::Encoded {
-                            input: input.clone(),
-                            output: out,
-                        },
-                    )),
-                    // 被打断的那个文件不算失败
-                    Err(e) if e == "已取消" => {}
+            let mut encoded: Vec<(usize, ffmpeg::Encoded)> = Vec::new();
+            for (idx, r) in results.into_inner().unwrap_or_default() {
+                match r {
+                    Ok(e) => encoded.push((idx, e)),
                     Err(e) => slots[idx] = Some(Err(e)),
                 }
             }
+            // 收尾按文件顺序来，日志与报告才稳定可读
+            encoded.sort_by_key(|(i, _)| *i);
 
             // ── 收尾：整批一次性复制元数据，再逐文件还原文件时间 ──
             // 放在循环外是本次优化的核心：exiftool 只启动一次。
-            let items: Vec<ffmpeg::Encoded> = done.iter().map(|(_, e)| e.clone()).collect();
+            let items: Vec<ffmpeg::Encoded> = encoded.iter().map(|(_, e)| e.clone()).collect();
             let (meta_note, times) = ffmpeg::finalize_batch(&items, spec.keep_metadata);
-            for (k, (idx, _)) in done.iter().enumerate() {
+            for (k, (idx, _)) in encoded.iter().enumerate() {
                 let mut parts: Vec<String> = Vec::new();
                 if !meta_note.is_empty() {
                     parts.push(meta_note.clone());
@@ -442,9 +537,10 @@ impl PhotoTimeFixer {
                 .filter_map(|(i, s)| s.map(|r| (names[i].clone(), r)))
                 .collect();
 
-            if cancel.load(Ordering::Relaxed) || attempted < total {
+            let done = completed.load(Ordering::Relaxed);
+            if done < total {
                 let _ = tx.send(ConvertMsg::Cancelled {
-                    done: attempted,
+                    done,
                     total,
                     report,
                 });

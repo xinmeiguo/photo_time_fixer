@@ -138,22 +138,100 @@ pub fn write_metadata(
     is_video: bool,
 ) -> Result<(), String> {
     let exep = exiftool_path().ok_or_else(|| "未找到 exiftool".to_string())?;
-    let mut lines: Vec<String> = vec!["-overwrite_original".into()];
+    let one = MetaWrite { path, dt, is_video };
+    run_write_once(&exep, std::slice::from_ref(&one), offset)
+}
 
-    let dt_str = if is_video {
+/// 一条「写元数据」指令，批量写入的最小单元。
+pub struct MetaWrite<'a> {
+    pub path: &'a Path,
+    /// 本地墙钟时间（未带时区）
+    pub dt: NaiveDateTime,
+    pub is_video: bool,
+}
+
+/// 一批文件的元数据写入：整批**只启动一次** exiftool，返回逐文件结果。
+///
+/// 返回 `Vec<Result<(), String>>`，下标与 `items` 一一对应：
+/// 批量成功时全是 `Ok`；批量失败时回落到「逐文件重试」，才能真正定位到坏文件
+/// （整批只能拿到一个退出码，不回落的话用户只知道"有一张失败"，不知道是哪张）。
+///
+/// ### 为什么能混合照片和视频
+/// `-api QuickTimeUTC` 放在**各自的 `-execute` 分段内部**，只对那一段生效。
+/// 照片段不带 `-api`，所以两类文件混在同一份参数文件里不会互相串味（真机实测过）。
+pub fn write_metadata_batch(
+    items: &[MetaWrite<'_>],
+    offset: FixedOffset,
+) -> Vec<Result<(), String>> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let exep = match exiftool_path() {
+        Some(p) => p,
+        None => return vec![Err("未找到 exiftool".to_string()); items.len()],
+    };
+    if let Ok(()) = run_write_once(&exep, items, offset) {
+        return vec![Ok(()); items.len()];
+    }
+    // 整批失败：逐个重试，把错误精确落到具体文件上。
+    // 打得开的文件会被写上第二次，但写入是幂等的（同样的值），不影响结果。
+    items
+        .iter()
+        .map(|it| write_metadata(it.path, it.dt, offset, it.is_video))
+        .collect()
+}
+
+/// 执行一批写入（一个 exiftool 进程，`-execute` 分段）。
+fn run_write_once(exep: &Path, items: &[MetaWrite<'_>], offset: FixedOffset) -> Result<(), String> {
+    let lines = batch_write_lines(items, offset);
+
+    // 通过 UTF-8 参数文件 + -charset filename=UTF8 绕过 Windows 命令行编码问题
+    let argfile = temp_argfile_path("ptf_write");
+    std::fs::write(&argfile, lines.join("\n")).map_err(|e| format!("写入参数文件失败: {e}"))?;
+    let out = Command::new(exep)
+        .arg("-charset")
+        .arg("filename=UTF8")
+        .arg("-@")
+        .arg(&argfile)
+        .output();
+    let _ = std::fs::remove_file(&argfile);
+    let out = out.map_err(|e| format!("执行 exiftool 失败: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!("exiftool 报错: {}", last_line(&out.stderr)))
+    }
+}
+
+/// 拼出整批写入的参数文件内容（纯字符串，便于单测锁死分段与 `-api` 归属）。
+fn batch_write_lines(items: &[MetaWrite<'_>], offset: FixedOffset) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for (i, it) in items.iter().enumerate() {
+        if i > 0 {
+            lines.push("-execute".into());
+        }
+        lines.extend(meta_argfile_lines(it, offset));
+    }
+    lines
+}
+
+/// 单个文件在参数文件里的一段（纯字符串，便于单测锁死分段与 `-api` 归属）。
+fn meta_argfile_lines(it: &MetaWrite<'_>, offset: FixedOffset) -> Vec<String> {
+    let mut lines: Vec<String> = vec!["-overwrite_original".into()];
+    let dt_str = if it.is_video {
+        // -api 必须留在本段内：它只对当前 -execute 段生效，
+        // 这样同一份参数文件里的照片段不会被 QuickTimeUTC 影响。
         lines.push("-api".into());
         lines.push("QuickTimeUTC".into());
-        let dt = dt
-            .and_local_timezone(offset)
-            .single()
-            .expect("fixed offset is unambiguous");
-        dt.format("%Y:%m:%d %H:%M:%S%:z").to_string()
+        crate::datetime::with_offset(it.dt, offset)
+            .format("%Y:%m:%d %H:%M:%S%:z")
+            .to_string()
     } else {
-        dt.format("%Y:%m:%d %H:%M:%S").to_string()
+        it.dt.format("%Y:%m:%d %H:%M:%S").to_string()
     };
 
     // 注意：-TAG=VALUE 必须作为单个参数传给 exiftool，否则 VALUE 会被当成文件路径。
-    if is_video {
+    if it.is_video {
         lines.push(format!("-CreateDate={dt_str}"));
         lines.push(format!("-ModifyDate={dt_str}"));
     } else {
@@ -161,25 +239,8 @@ pub fn write_metadata(
         lines.push(format!("-CreateDate={dt_str}"));
         lines.push(format!("-ModifyDate={dt_str}"));
     }
-    lines.push(path.to_string_lossy().to_string());
-
-    // 通过 UTF-8 参数文件 + -charset filename=UTF8 绕过 Windows 命令行编码问题
-    let argfile = temp_argfile_path("ptf_write");
-    std::fs::write(&argfile, lines.join("\n")).map_err(|e| format!("写入参数文件失败: {e}"))?;
-    let out = Command::new(&exep)
-        .arg("-charset")
-        .arg("filename=UTF8")
-        .arg("-@")
-        .arg(&argfile)
-        .output()
-        .map_err(|e| format!("执行 exiftool 失败: {e}"))?;
-    let _ = std::fs::remove_file(&argfile);
-    if out.status.success() {
-        Ok(())
-    } else {
-        let err = String::from_utf8_lossy(&out.stderr);
-        Err(format!("exiftool 报错: {}", err.trim()))
-    }
+    lines.push(it.path.to_string_lossy().to_string());
+    lines
 }
 
 /// 一次性批量读取多个文件的“拍摄时间”，只启动一个 exiftool 进程。
@@ -343,13 +404,12 @@ fn last_line(raw: &[u8]) -> String {
 }
 
 fn temp_argfile_path(prefix: &str) -> PathBuf {
-    // pid + 毫秒：同一进程里连续调用不会撞名（读、写、批量复制都用这一个函数）。
-    // 只用 pid 时，并行化或连续调用会互相覆盖参数文件。
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    std::env::temp_dir().join(format!("{}_{}_{}.args", prefix, std::process::id(), ms))
+    // pid + 进程内单调序号：连续调用、跨线程调用都不会撞名。
+    // 之前用「pid + 毫秒」——同一毫秒内起两个线程就会互相覆盖参数文件，
+    // 症状是参数看起来对、结果却串了，极难排查。序号是零成本的确定性方案。
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!("{}_{}_{}.args", prefix, std::process::id(), n))
 }
 
 #[cfg(test)]
@@ -401,12 +461,92 @@ mod tests {
         assert_eq!(lines.last().map(|s| s.as_str()), Some("b.mp4"));
     }
 
-    /// 参数文件名带毫秒：同进程内连续两次调用不能撞名。
+    /// 参数文件名必须唯一：同进程内连续两次调用不能撞名。
     #[test]
     fn argfile_names_are_unique_enough() {
         let a = temp_argfile_path("ptf_t");
-        std::thread::sleep(std::time::Duration::from_millis(2));
         let b = temp_argfile_path("ptf_t");
         assert_ne!(a, b);
+        // 同一毫秒内连续生成 100 个也不能重复（旧实现用毫秒时间戳会大量重复）
+        let many: std::collections::HashSet<PathBuf> =
+            (0..100).map(|_| temp_argfile_path("ptf_t")).collect();
+        assert_eq!(many.len(), 100);
+    }
+
+    fn dt() -> NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+            .unwrap()
+            .and_hms_opt(9, 0, 0)
+            .unwrap()
+    }
+
+    fn off8() -> FixedOffset {
+        FixedOffset::east_opt(8 * 3600).unwrap()
+    }
+
+    /// ★ 回归锁：`-api QuickTimeUTC` 只能停在视频那一段里面。
+    ///
+    /// 它是个「全局状态」类选项，但 exiftool 的 `-execute` 会把当前状态存档，
+    /// 所以写在段内就只对这一段的后续文件生效。照片段一旦沾上它，
+    /// 写进去的时间会被当成 UTC 再转一次，整批时间差 8 小时。
+    #[test]
+    fn batch_write_keeps_api_inside_video_section() {
+        let photo = MetaWrite {
+            path: Path::new(r"D:\a.jpg"),
+            dt: dt(),
+            is_video: false,
+        };
+        let video = MetaWrite {
+            path: Path::new(r"D:\b.mp4"),
+            dt: dt(),
+            is_video: true,
+        };
+        // 故意把视频放前面：反过来也一样要守住
+        let lines = batch_write_lines(&[video, photo], off8());
+
+        assert_eq!(lines.iter().filter(|l| l.as_str() == "-execute").count(), 1);
+        let exec_at = lines.iter().position(|l| l == "-execute").unwrap();
+        let api_at = lines.iter().position(|l| l == "-api").unwrap();
+        assert!(api_at < exec_at, "-api 必须在第一段（视频）内部");
+        assert_eq!(lines[api_at + 1], "QuickTimeUTC");
+        // 照片段（-execute 之后）不能再出现 -api
+        assert!(!lines[exec_at..].iter().any(|l| l == "-api"));
+    }
+
+    /// 照片写本地墙钟（不带时区后缀），视频写带偏移的 UTC 表示。
+    #[test]
+    fn write_lines_format_photo_and_video_differently() {
+        let photo = MetaWrite {
+            path: Path::new(r"D:\a.jpg"),
+            dt: dt(),
+            is_video: false,
+        };
+        let pl = meta_argfile_lines(&photo, off8());
+        assert!(pl.contains(&"-DateTimeOriginal=2026:01:01 09:00:00".to_string()));
+        assert_eq!(pl.first().map(|s| s.as_str()), Some("-overwrite_original"));
+        assert_eq!(pl.last().map(|s| s.as_str()), Some(r"D:\a.jpg"));
+
+        let video = MetaWrite {
+            path: Path::new(r"D:\b.mp4"),
+            dt: dt(),
+            is_video: true,
+        };
+        let vl = meta_argfile_lines(&video, off8());
+        // 视频只有 CreateDate / ModifyDate，且时间带 +08:00
+        assert!(!vl.iter().any(|l| l.starts_with("-DateTimeOriginal=")));
+        assert!(vl.contains(&"-CreateDate=2026:01:01 09:00:00+08:00".to_string()));
+        assert!(vl.contains(&"-ModifyDate=2026:01:01 09:00:00+08:00".to_string()));
+    }
+
+    /// 负偏移要写成 `-05:00`，不能写成 `-5:0`（exiftool 会拒绝解析）。
+    #[test]
+    fn negative_offset_is_padded() {
+        let it = MetaWrite {
+            path: Path::new("v.mp4"),
+            dt: dt(),
+            is_video: true,
+        };
+        let lines = meta_argfile_lines(&it, FixedOffset::east_opt(-5 * 3600).unwrap());
+        assert!(lines.contains(&"-CreateDate=2026:01:01 09:00:00-05:00".to_string()));
     }
 }

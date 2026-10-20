@@ -11,25 +11,38 @@ use super::PhotoTimeFixer;
 
 impl PhotoTimeFixer {
     pub(super) fn render_time(&mut self, ui: &mut egui::Ui) {
+        // 忙 = 任一条链路在跑。两条链路都要用 exiftool 重写同一个文件，
+        // 并发跑会互相踩（exiftool 是整文件重写，不是原地改），所以互斥。
+        let busy = self.applying || self.converting;
+
         // 文件夹
         ui.horizontal(|ui| {
             ui.label("文件夹:");
-            ui.text_edit_singleline(&mut self.folder);
-            if ui.button("选择文件夹…").clicked() {
+            ui.add_enabled(!busy, egui::TextEdit::singleline(&mut self.folder));
+            if ui
+                .add_enabled(!busy, egui::Button::new("选择文件夹…"))
+                .clicked()
+            {
                 if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                     self.folder = dir.to_string_lossy().to_string();
                     self.rescan();
                 }
             }
-            ui.checkbox(&mut self.recursive, "包含子文件夹");
+            ui.add_enabled(
+                !busy,
+                egui::Checkbox::new(&mut self.recursive, "包含子文件夹"),
+            );
             if ui
-                .add_enabled(!self.scanning, egui::Button::new("刷新扫描"))
+                .add_enabled(!self.scanning && !busy, egui::Button::new("刷新扫描"))
                 .clicked()
             {
                 self.rescan();
             }
             if self.scanning {
                 ui.label("扫描中…");
+            }
+            if busy {
+                ui.label("处理中，暂不可改");
             }
         });
         ui.separator();
@@ -124,6 +137,9 @@ impl PhotoTimeFixer {
     }
 
     fn render_time_buttons(&mut self, ui: &mut egui::Ui) {
+        // 应用/恢复都要用 exiftool 重写文件，转换也在写同一批文件，
+        // 两者同时跑会读到对方的中间态。互斥放在按钮层最直观。
+        let busy = self.applying || self.converting;
         ui.horizontal(|ui| {
             let btn_size = egui::vec2(140.0, 36.0);
 
@@ -143,19 +159,23 @@ impl PhotoTimeFixer {
 
             let apply_btn = egui::Button::new(egui::RichText::new("应用修改").size(15.0).strong())
                 .min_size(btn_size);
-            if ui.add_enabled(!self.applying, apply_btn).clicked() {
+            if ui.add_enabled(!busy, apply_btn).clicked() {
                 self.do_apply();
             }
 
             let restore_btn = egui::Button::new(egui::RichText::new("恢复…").size(15.0).strong())
                 .min_size(btn_size);
-            if ui.add(restore_btn).clicked() {
+            if ui.add_enabled(!busy, restore_btn).clicked() {
                 if let Some(file) = rfd::FileDialog::new()
                     .add_filter("备份", &["json"])
                     .pick_file()
                 {
                     self.do_restore(&file);
                 }
+            }
+
+            if self.converting {
+                ui.label("视频转换进行中，暂不可修改时间");
             }
         });
     }
@@ -201,9 +221,9 @@ impl PhotoTimeFixer {
             ui.add(egui::ProgressBar::new(frac).show_percentage());
             ui.label(format!("{}/{}", self.progress_done, self.progress_total));
             if self.applying && ui.button("取消").clicked() {
-                // 只置标志，真正的停止点在线程的每轮循环开头
+                // 只置标志，真正的停止点在后台线程的「每批开头」
                 self.apply_cancel.store(true, Ordering::Relaxed);
-                self.log("已请求取消，当前文件处理完后停止…".into());
+                self.log("已请求取消，当前这一批处理完后停止（最多几秒）…".into());
             }
         });
         if !self.progress_current.is_empty() {

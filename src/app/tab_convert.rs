@@ -11,19 +11,29 @@ use super::PhotoTimeFixer;
 
 impl PhotoTimeFixer {
     pub(super) fn render_convert(&mut self, ui: &mut egui::Ui) {
+        // 与「修改时间」页互斥：转换读的源文件可能正被 exiftool 重写，
+        // 而 exiftool 是整文件重写（不是原地改），读到的会是中间态。
+        let busy = self.applying || self.converting;
+
         // 文件夹选择（与时间页共享 folder/recursive，可独立触发扫描）
         ui.horizontal(|ui| {
             ui.label("文件夹:");
-            ui.text_edit_singleline(&mut self.folder);
-            if ui.button("选择文件夹…").clicked() {
+            ui.add_enabled(!busy, egui::TextEdit::singleline(&mut self.folder));
+            if ui
+                .add_enabled(!busy, egui::Button::new("选择文件夹…"))
+                .clicked()
+            {
                 if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                     self.folder = dir.to_string_lossy().to_string();
                     self.rescan();
                 }
             }
-            ui.checkbox(&mut self.recursive, "包含子文件夹");
+            ui.add_enabled(
+                !busy,
+                egui::Checkbox::new(&mut self.recursive, "包含子文件夹"),
+            );
             if ui
-                .add_enabled(!self.scanning, egui::Button::new("刷新扫描"))
+                .add_enabled(!self.scanning && !busy, egui::Button::new("刷新扫描"))
                 .clicked()
             {
                 self.rescan();
@@ -84,8 +94,11 @@ impl PhotoTimeFixer {
         });
         ui.horizontal(|ui| {
             ui.label("输出目录(留空=视频文件夹\\out):");
-            ui.text_edit_singleline(&mut self.convert_out_dir);
-            if ui.button("选择目录…").clicked() {
+            ui.add_enabled(!busy, egui::TextEdit::singleline(&mut self.convert_out_dir));
+            if ui
+                .add_enabled(!busy, egui::Button::new("选择目录…"))
+                .clicked()
+            {
                 if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                     self.convert_out_dir = dir.to_string_lossy().to_string();
                 }
@@ -104,11 +117,14 @@ impl PhotoTimeFixer {
             let convert_btn =
                 egui::Button::new(egui::RichText::new("开始转换").size(15.0).strong())
                     .min_size(btn_size);
-            if ui.add_enabled(!self.converting, convert_btn).clicked() {
+            if ui.add_enabled(!busy, convert_btn).clicked() {
                 self.start_convert();
             }
             if !self.ffmpeg_installed {
                 ui.colored_label(egui::Color32::from_rgb(200, 80, 60), "未安装 ffmpeg");
+            }
+            if self.applying {
+                ui.label("时间修改进行中，暂不可转换");
             }
         });
 
@@ -145,7 +161,7 @@ impl PhotoTimeFixer {
                 // 置位后：正在跑的 ffmpeg 会被杀掉（未完成的产物自动删除），
                 // 后面的文件不再开工。
                 self.convert_cancel.store(true, Ordering::Relaxed);
-                self.log("已请求取消，正在中止当前视频…".into());
+                self.log("已请求取消，正在中止转码中的视频…".into());
             }
         });
         if !self.progress_current.is_empty() {

@@ -41,6 +41,11 @@ pub struct ConvertSpec {
     pub keep_metadata: bool,
     /// 输出已存在时是否覆盖。
     pub overwrite: bool,
+    /// 每个 ffmpeg 进程的线程上限。None = 交给编码器自适应。
+    ///
+    /// 并发跑多个 ffmpeg 时必须限流：x264 默认按 CPU 核数开线程，
+    /// 两个进程各自开满就会互相抢核，总耗时反而变长。
+    pub threads: Option<u32>,
 }
 
 /// 返回 ffmpeg 可执行文件路径（可能是命令名 "ffmpeg" 或具体路径）。
@@ -198,6 +203,13 @@ pub fn output_path(input: &Path, target_ext: &str, out_dir: Option<&Path>) -> Pa
     out
 }
 
+/// 进程内单调递增的 ffmpeg 日志序号。
+/// 并发跑多个 ffmpeg 时，用纳秒时间戳做文件名理论上仍可能撞在一个 tick 上。
+fn next_log_seq() -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
 /// 单个文件的**转码**阶段：只跑 ffmpeg，不碰元数据、不碰文件时间。
 ///
 /// 为什么拆开：元数据复制要调用 exiftool，而 exiftool 每启动一次就是
@@ -310,18 +322,22 @@ pub fn encode_one(
             cmd.arg("-movflags").arg("+faststart");
         }
     }
+    // 线程上限只对重编码有意义；`-c copy` 没有编码器，传了只会多一条警告。
+    if let Some(n) = spec.threads {
+        if !matches!(spec.mode, ConvertMode::Copy) {
+            cmd.arg("-threads").arg(n.to_string());
+        }
+    }
     cmd.arg(output);
     cmd.stdout(Stdio::null());
 
     // stderr 落到临时文件而不是管道：ffmpeg 的进度/警告输出量很大，管道写满而
     // 父进程不读时会死锁；写文件既避免死锁，也让「取消」能安全杀掉子进程后再读日志。
+    // 文件名带进程内单调序号：并发跑多个 ffmpeg 时，纳秒时间戳理论上也可能撞。
     let err_path = std::env::temp_dir().join(format!(
         "ptf_ff_{}_{}.log",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
+        next_log_seq()
     ));
     let err_file =
         std::fs::File::create(&err_path).map_err(|e| format!("创建 ffmpeg 日志失败: {e}"))?;

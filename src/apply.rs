@@ -9,6 +9,7 @@ use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 use chrono::{Duration, FixedOffset, NaiveDateTime};
 use rand::Rng;
 
+use crate::datetime;
 use crate::exiftool;
 use crate::files::{MediaFile, MediaKind};
 
@@ -103,64 +104,62 @@ pub enum ProgressMsg {
     Done(Vec<(String, Result<(), String>)>),
 }
 
-/// 处理单个文件的时间修改。逻辑与原 `apply` 逐字一致，仅供拆分复用。
-pub fn apply_one(
+/// 只设文件系统时间（创建/修改/访问）。
+///
+/// ★ 必须在元数据写入**之后**调用：`-overwrite_original` 会重写整个文件，
+/// 把修改时间刷成“现在”，先设会被覆盖掉。
+fn set_times_one(
     item: &PlanItem,
     offset: FixedOffset,
     set_created: bool,
     set_modified: bool,
-    set_taken: bool,
 ) -> Result<(), String> {
     let path = &item.file.path;
-    let is_video = matches!(item.file.kind, MediaKind::Video);
-    let mut errs: Vec<String> = Vec::new();
+    let instant = UNIX_EPOCH
+        + StdDuration::from_secs(
+            datetime::with_offset(item.new_time, offset)
+                .timestamp()
+                .max(0) as u64,
+        );
 
-    // 先写元数据；exiftool -overwrite_original 会改变文件系统修改时间，
-    // 因此文件系统时间必须放在最后设置，才能保留用户指定的创建/修改时间。
-    if set_taken {
-        if let Err(e) = exiftool::write_metadata(path, item.new_time, offset, is_video) {
-            errs.push(e);
-        }
-    }
+    let meta = fs::metadata(path).ok();
+    let cur_created = meta
+        .as_ref()
+        .and_then(|m| m.created().ok())
+        .unwrap_or(instant);
+    let cur_modified = meta
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .unwrap_or(instant);
+    let new_created = if set_created { instant } else { cur_created };
+    let new_modified = if set_modified { instant } else { cur_modified };
+    let new_accessed = new_modified;
 
-    if set_created || set_modified {
-        let dt = item
-            .new_time
-            .and_local_timezone(offset)
-            .single()
-            .expect("fixed offset is unambiguous");
-        let secs = dt.timestamp().max(0) as u64;
-        let instant = UNIX_EPOCH + StdDuration::from_secs(secs);
-
-        let meta = fs::metadata(path).ok();
-        let cur_created = meta
-            .as_ref()
-            .and_then(|m| m.created().ok())
-            .unwrap_or(instant);
-        let cur_modified = meta
-            .as_ref()
-            .and_then(|m| m.modified().ok())
-            .unwrap_or(instant);
-        let new_created = if set_created { instant } else { cur_created };
-        let new_modified = if set_modified { instant } else { cur_modified };
-        let new_accessed = new_modified;
-
-        if let Err(e) = set_fs_times(path, new_created, new_accessed, new_modified) {
-            errs.push(format!("文件系统时间: {e}"));
-        }
-    }
-
-    if errs.is_empty() {
-        Ok(())
-    } else {
-        Err(errs.join("; "))
-    }
+    set_fs_times(path, new_created, new_accessed, new_modified).map_err(|e| e.to_string())
 }
 
-/// 应用计划（带进度回传）。在后台线程中逐文件处理，并通过 `tx` 实时上报进度，
+/// 每批处理多少个文件。
+///
+/// 为什么不「一次全批」：
+/// - 一个坏文件会让整批退出码非 0，回落到逐文件重试时等于白跑一遍；
+/// - 分块后「取消」最迟在块边界生效，进度条也有机会往前走。
+///
+/// 为什么是 32（实测，200 张 1.6 MB JPEG）：
+/// - 逐文件：1.35 s/张 → 200 张约 4.5 分钟
+/// - 一次全批：约 49 s（只有 1 次启动开销，但取消要等 49 秒）
+/// - 32/块：57 s（7 次启动开销多花 8 s，换来取消延迟 ≤ 8 秒）
+///
+/// 也就是说启动开销只占三成，块大小对总时间影响很小 —— 用 17% 的时间
+/// 换 6 倍的取消响应速度，是划算的。块再小就没意义了（16/块 反而慢 15%）。
+const APPLY_CHUNK: usize = 32;
+
+/// 应用计划（带进度回传）。在后台线程中按块处理，并通过 `tx` 实时上报进度，
 /// 全部完成后发送 `ProgressMsg::Done`。
 ///
-/// `cancel` 每处理完一个文件检查一次；置位则停止开工并发送 `ProgressMsg::Cancelled`。
+/// 处理顺序：**整块先写元数据（一次 exiftool）→ 再逐文件设文件系统时间**。
+/// 顺序反了会丢时间（见 `set_times_one` 的说明）。
+///
+/// `cancel` 每块检查一次；置位则停止开工并发送 `ProgressMsg::Cancelled`。
 /// 已改过的文件**不回滚**（回滚请用备份「恢复…」），只是不再继续。
 pub fn apply_with_progress(
     plan: Vec<PlanItem>,
@@ -174,26 +173,80 @@ pub fn apply_with_progress(
     use std::sync::atomic::Ordering;
 
     let total = plan.len();
-    let mut report = Vec::with_capacity(total);
-    for (i, item) in plan.into_iter().enumerate() {
+    let mut report: Vec<(String, Result<(), String>)> = Vec::with_capacity(total);
+    let mut done = 0usize;
+
+    for chunk in plan.chunks(APPLY_CHUNK) {
         if cancel.load(Ordering::Relaxed) {
             let _ = tx.send(ProgressMsg::Cancelled {
-                done: i,
+                done,
                 total,
                 report,
             });
             return;
         }
-        let name = item.file.name.clone();
-        let current = item.file.name.clone();
-        let res = apply_one(&item, offset, set_created, set_modified, set_taken);
-        report.push((name, res));
+        // 块开工前报一次：一整批要跑好几秒，界面得知道在动。
+        // current 写「首个文件名 等 N 个」而不是只写第一个：整批是一次 exiftool
+        // 调用同时处理的，只显示一个名字会让用户以为在逐个处理。
+        let current = match chunk.first() {
+            Some(first) if chunk.len() > 1 => {
+                format!("{} 等 {} 个", first.file.name, chunk.len())
+            }
+            Some(first) => first.file.name.clone(),
+            None => String::new(),
+        };
         let _ = tx.send(ProgressMsg::Progress {
-            done: i + 1,
+            done,
             total,
             current,
         });
+
+        // ① 元数据：整块只启动一次 exiftool；失败时由它内部回落逐文件重试。
+        let meta: Vec<Option<Result<(), String>>> = if set_taken {
+            let items: Vec<exiftool::MetaWrite<'_>> = chunk
+                .iter()
+                .map(|i| exiftool::MetaWrite {
+                    path: &i.file.path,
+                    dt: i.new_time,
+                    is_video: matches!(i.file.kind, MediaKind::Video),
+                })
+                .collect();
+            exiftool::write_metadata_batch(&items, offset)
+                .into_iter()
+                .map(Some)
+                .collect()
+        } else {
+            vec![None; chunk.len()]
+        };
+
+        // ② 文件系统时间：逐文件调 Win32 SetFileTime（微秒级，无需批量）
+        for (item, meta_res) in chunk.iter().zip(meta) {
+            let mut errs: Vec<String> = Vec::new();
+            if let Some(Err(e)) = meta_res {
+                errs.push(e);
+            }
+            if set_created || set_modified {
+                if let Err(e) = set_times_one(item, offset, set_created, set_modified) {
+                    errs.push(format!("文件系统时间: {e}"));
+                }
+            }
+            report.push((
+                item.file.name.clone(),
+                if errs.is_empty() {
+                    Ok(())
+                } else {
+                    Err(errs.join("; "))
+                },
+            ));
+            done += 1;
+        }
     }
+
+    let _ = tx.send(ProgressMsg::Progress {
+        done,
+        total,
+        current: String::new(),
+    });
     let _ = tx.send(ProgressMsg::Done(report));
 }
 
