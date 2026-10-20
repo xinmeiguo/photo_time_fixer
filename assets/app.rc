@@ -9,8 +9,8 @@
 // 公司、版本都来自这里。缺了这段，Windows 只能回退到文件名甚至
 // 框架默认信息（看上去就像个 egui 示例程序）。
 1 VERSIONINFO
-FILEVERSION 1,1,0,0
-PRODUCTVERSION 1,1,0,0
+FILEVERSION 1,1,1,0
+PRODUCTVERSION 1,1,1,0
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0x0L
 FILEOS 0x40004L
@@ -23,12 +23,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "XINWEI"
             VALUE "FileDescription", "照片/视频时间修改工具"
-            VALUE "FileVersion", "1.1.0.0"
+            VALUE "FileVersion", "1.1.1.0"
             VALUE "InternalName", "photo_time_fixer"
             VALUE "LegalCopyright", "Copyright (C) XINWEI. All rights reserved."
             VALUE "OriginalFilename", "photo_time_fixer.exe"
             VALUE "ProductName", "照片/视频时间修改工具"
-            VALUE "ProductVersion", "1.1.0.0"
+            VALUE "ProductVersion", "1.1.1.0"
         END
     END
     BLOCK "VarFileInfo"

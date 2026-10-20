@@ -1,6 +1,6 @@
 [package]
 name = "photo_time_fixer"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2021"
 description = "批量修改照片/视频的拍摄时间与文件时间，并支持视频格式转换/压缩"
 authors = ["XINWEI"]
