@@ -14,8 +14,8 @@ undo_*.json
 # 本机构建日志（cargo build/test 重定向产生）
 *.log
 
-# 推送用临时目录（可能含临时取得的 token，绝不入库）
-.tmp_api/
+# 推送 / 发版用临时目录（可能含临时取得的 token，绝不入库）
+.tmp_*/
 
 # 编辑器与系统文件
 .vscode/
